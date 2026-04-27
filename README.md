@@ -13,10 +13,14 @@ Pointer is a thin SwiftUI front-end on top of **Claude Code** — the LLM agent 
 
 Pointer auto-installs its computer-access helper during the first-run onboarding flow — no manual setup required.
 
-## Quick start
+## Install
+
+**Download the latest release** from the [Releases page](https://github.com/obaid/pointer/releases/latest) — grab `Pointer-X.Y.Z.zip`, unzip it, and drag `Pointer.app` to `/Applications`. The build is signed with an Apple Developer ID and notarized, so it just opens.
+
+## Quick start (build from source)
 
 ```bash
-git clone https://github.com/<your-username>/pointer.git
+git clone https://github.com/obaid/pointer.git
 cd pointer
 swift run Pointer
 ```
