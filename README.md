@@ -2,13 +2,20 @@
 
 A native macOS menu-bar agent. You give it a task in plain English (typed or dictated), it drives your Mac to get it done — clicking, typing, reading the screen — and streams what it's doing into a small floating "orb" in the top-right corner.
 
-Pointer is a thin SwiftUI front-end on top of **Claude Code** — the LLM agent does the reasoning, and Pointer wires it up to the Mac (screenshot, accessibility tree, click, type, hotkey, launch app, …) so it can actually take action. The app shells out to `claude -p --output-format stream-json` and parses the NDJSON event stream into the activity feed.
+Pointer is a thin SwiftUI front-end on top of an LLM coding agent CLI — the LLM does the reasoning, and Pointer wires it up to the Mac (screenshot, accessibility tree, click, type, hotkey, launch app, …) so it can actually take action. Pointer ships with two engines:
+
+- **[Claude Code](https://docs.claude.com/en/docs/claude-code)** — Anthropic's terminal coding agent.
+- **[Codex CLI](https://developers.openai.com/codex)** — OpenAI's terminal coding agent.
+
+You only need one installed to use Pointer; with both installed you can pick the engine per task from a chip in the command bar, with a saved default.
 
 ## Requirements
 
 - **macOS 26.0** or later (uses the new Speech framework's `SpeechAnalyzer` for on-device dictation)
 - **Xcode 26** / Swift 6 toolchain (any version that ships the macOS 26 SDK)
-- **Claude Code CLI** installed and authenticated — install instructions: <https://docs.claude.com/en/docs/claude-code>
+- **At least one engine installed and authenticated**:
+  - Claude Code: <https://docs.claude.com/en/docs/claude-code>
+  - Codex CLI: `npm install -g @openai/codex` then `codex login`
 - A microphone (optional — only if you want voice input)
 
 Pointer auto-installs its computer-access helper during the first-run onboarding flow — no manual setup required.
@@ -29,17 +36,18 @@ That's it. The first launch:
 
 1. Drops a status-bar icon (no Dock icon — Pointer runs as an "accessory" app).
 2. Walks you through three onboarding steps:
-   - **AI engine** — verifies `claude` is installed and runs.
-   - **Computer access** — installs the helper that lets Pointer click, type, and read your apps (one click).
+   - **AI engines** — detects which of Claude / Codex you have installed; pick a default for new tasks. At least one is required.
+   - **Computer access** — installs the helper that lets Pointer click, type, and read your apps and registers it with every engine you have installed (one click).
    - **Voice input** *(optional)* — requests Microphone + Speech Recognition permission.
 3. Use **New Task...** from the menu, or press ⌘N when the menu is open, to summon the command bar.
 
 ## Using it
 
 - **Command bar** — type a prompt and hit Return. Shift+Return inserts a newline. Esc clears or closes.
+- **Engine chip** — bottom-right of the command bar (only when both engines are installed). Picks which engine handles the next task; the choice is remembered as your default.
 - **Mic button** — click to dictate. Words stream into the field as you speak. Click again (or Esc) to stop.
-- **Orb** — appears top-right while a task is running. Click to expand and see the activity feed. Cancel from the expanded panel.
-- **Follow-ups** — once a task completes, the expanded orb shows a reply field that resumes the same Claude session (`claude -r <session_id>`).
+- **Orb stack** — appears top-right while tasks are running. Up to **5 concurrent agents**; submitting a new task while others are in-flight adds to the stack rather than cancelling. Each card shows which engine ran it. Hover a collapsed card for a one-click dismiss.
+- **Follow-ups** — once a task completes, the expanded orb shows a reply field that resumes the same engine session (Claude `-r <session_id>` or `codex exec resume <thread_id>`).
 - **Awaiting reply signal** — when the agent finishes a turn with a question, the orb's status dot turns **amber** (instead of green), the menu bar icon shimmers in amber, and the orb auto-expands once so you don't miss it.
 - **History** — menu bar → **History...** opens a separate window listing every task you've run, with the full activity feed and final result. Stays browsable while a new task runs through the orb. Persisted at `~/Library/Application Support/Pointer/history.jsonl`.
 
@@ -47,20 +55,25 @@ That's it. The first launch:
 
 ```
 Sources/Pointer/
-├── PointerApp.swift          # @main, AppDelegate, window/panel plumbing
-├── AgentStore.swift          # @MainActor ObservableObject — single-task state
-├── CommandBarView.swift      # Spotlight-style input
-├── OrbView.swift             # Top-right floating activity panel
-├── OnboardingView.swift      # First-run setup
-├── HistoryStore.swift        # Persistent task log (JSONL)
-├── HistoryView.swift         # "History" window (master-detail browser)
-├── Prereqs.swift             # Detects + installs prerequisites at first run
-├── ClaudeBinary.swift        # Locates the `claude` CLI on $PATH
-├── StubRunner.swift          # Spawns claude -p, streams NDJSON
-├── StreamEventParser.swift   # NDJSON → ActivityEvent + tool-name humanizer
-├── Dictator.swift            # SpeechAnalyzer + AVAudioEngine wrapper
-├── HotkeyMonitor.swift       # Global fn-hold hotkey (currently disabled)
-└── Info.plist                # Embedded into the binary via -sectcreate
+├── PointerApp.swift                # @main, AppDelegate, window/panel plumbing
+├── AgentStore.swift                # @MainActor ObservableObject — multi-task state + dispatch by engine
+├── Engines.swift                   # RunnerEngine enum, CodexBinary, EnginePreference
+├── EngineBadge.swift               # EngineBadge pill + EnginePicker chip
+├── CommandBarView.swift            # Spotlight-style input + slot indicator + engine picker
+├── OrbView.swift                   # Top-right floating orb stack
+├── OnboardingView.swift            # First-run setup with per-engine status + default picker
+├── HistoryStore.swift              # Persistent task log (JSONL)
+├── HistoryView.swift               # "History" window (master-detail browser)
+├── Prereqs.swift                   # Detects engines + installs cua-driver across each
+├── ClaudeBinary.swift              # Tool path resolver (commonPaths → which → zsh -ilc)
+├── ClaudeAgentRunner.swift         # Spawns claude -p, streams NDJSON
+├── CodexAgentRunner.swift          # Spawns codex exec --json, streams JSONL
+├── ClaudeStreamEventParser.swift   # Claude NDJSON → ActivityEvent
+├── CodexStreamEventParser.swift    # Codex JSONL → ActivityEvent
+├── ParseHelpers.swift              # Shared sanitize / humanize / strip-warning logic
+├── Dictator.swift                  # SpeechAnalyzer + AVAudioEngine wrapper
+├── HotkeyMonitor.swift             # Global fn-hold hotkey (currently disabled)
+└── Info.plist                      # Embedded into the binary via -sectcreate
 ```
 
 ### Why NSHostingView and not NSHostingController
@@ -113,7 +126,7 @@ The runner emits structured logs prefixed `🎤` (dictation) and `🤖` (agent) 
 
 ## Status
 
-Single-task v1. Multi-agent (multiple concurrent CLI instances, e.g., Claude + Codex + Gemini in parallel) is on the roadmap but not yet wired up. The fn-hold global hotkey is implemented but disabled by default — uncomment three lines in `PointerApp.applicationDidFinishLaunching` to re-enable.
+Multi-agent and multi-engine (Claude + Codex) ship today. Gemini and other engines may follow once their CLIs settle on a stable JSONL schema. The fn-hold global hotkey is implemented but disabled by default — uncomment three lines in `PointerApp.applicationDidFinishLaunching` to re-enable.
 
 ## License
 

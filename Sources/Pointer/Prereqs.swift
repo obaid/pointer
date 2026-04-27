@@ -21,44 +21,73 @@ final class PrereqsChecker: ObservableObject {
     }
 
     struct State: Equatable {
-        var aiEngine: CheckStatus = .unknown   // Claude Code installed
-        var computer: CheckStatus = .unknown   // cua-driver binary + registered
-        var voice: CheckStatus = .unknown      // mic + speech recognition authorized
+        /// Per-engine install status. Keyed by engine — Pointer needs at
+        /// least one resolved entry to run.
+        var engines: [RunnerEngine: CheckStatus] = [:]
+        /// cua-driver binary present + registered with every installed engine.
+        var computer: CheckStatus = .unknown
+        /// Mic + speech recognition authorized.
+        var voice: CheckStatus = .unknown
 
-        /// Voice is optional — Pointer works fully without it. Don't gate Continue on voice.
-        var allReady: Bool { aiEngine.isResolved && computer.isResolved }
+        /// Engines that are confirmed installed.
+        var installedEngines: [RunnerEngine] {
+            RunnerEngine.allCases.filter { (engines[$0] ?? .missing).isResolved }
+        }
+
+        /// Voice is optional. Computer access matters only if at least one
+        /// engine is present (no point checking otherwise). Continue is
+        /// enabled when there's at least one engine + computer access.
+        var allReady: Bool {
+            !installedEngines.isEmpty && computer.isResolved
+        }
     }
 
     @Published private(set) var state = State()
 
-    /// Resolved at startup — both binaries are looked up in standard install
-    /// locations and then on $PATH so the app works regardless of where the
-    /// user installed them.
-    private let claudePath: String = ClaudeBinary.locate()
     private let cuaDriverPath: String = CuaDriverBinary.locate()
     private let cuaInstallScript = "https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh"
 
     // MARK: - Detect
 
     func runAllChecks() async {
-        state.aiEngine = .checking
+        for engine in RunnerEngine.allCases {
+            state.engines[engine] = .checking
+        }
         state.computer = .checking
         state.voice = .checking
 
-        async let engine: CheckStatus = checkAIEngine()
+        async let engineResults = checkAllEngines()
         async let computer: CheckStatus = checkComputerAccess()
         async let voice: CheckStatus = checkVoice()
 
-        let (e, c, v) = await (engine, computer, voice)
-        state.aiEngine = e
+        let (results, c, v) = await (engineResults, computer, voice)
+        for (engine, status) in results {
+            state.engines[engine] = status
+        }
         state.computer = c
         state.voice = v
     }
 
-    private func checkAIEngine() async -> CheckStatus {
-        guard FileManager.default.isExecutableFile(atPath: claudePath) else { return .missing }
-        let result = await Shell.run(claudePath, ["--version"])
-        return result.exitCode == 0 ? .ok : .failed(result.stderr.isEmpty ? "Could not run AI engine" : result.stderr)
+    private func checkAllEngines() async -> [(RunnerEngine, CheckStatus)] {
+        await withTaskGroup(of: (RunnerEngine, CheckStatus).self) { group in
+            for engine in RunnerEngine.allCases {
+                group.addTask { [weak self] in
+                    let status = await (self?.checkEngine(engine) ?? .unknown)
+                    return (engine, status)
+                }
+            }
+            var collected: [(RunnerEngine, CheckStatus)] = []
+            for await result in group { collected.append(result) }
+            return collected
+        }
+    }
+
+    private func checkEngine(_ engine: RunnerEngine) async -> CheckStatus {
+        let path = engine.locateBinary()
+        guard FileManager.default.isExecutableFile(atPath: path) else { return .missing }
+        let result = await Shell.run(path, ["--version"])
+        if result.exitCode == 0 { return .ok }
+        return .failed(result.stderr.isEmpty ? "Could not run \(engine.displayName)" : result.stderr)
     }
 
     /// Mic + speech-recognition authorization. Both must be authorized for `.ok`.
@@ -78,13 +107,29 @@ final class PrereqsChecker: ObservableObject {
         }
     }
 
+    /// Computer access is OK when the cua-driver binary exists AND is
+    /// registered as an MCP server with EVERY installed engine. If no engine
+    /// is installed yet, we can't check — return missing so the row stays
+    /// actionable once one is installed.
     private func checkComputerAccess() async -> CheckStatus {
         guard FileManager.default.isExecutableFile(atPath: cuaDriverPath) else { return .missing }
-        let listed = await Shell.run(claudePath, ["mcp", "list"])
-        if listed.exitCode != 0 {
-            return .failed("Could not query AI engine plugins")
+
+        let installed = RunnerEngine.allCases.filter {
+            FileManager.default.isExecutableFile(atPath: $0.locateBinary())
         }
-        return listed.stdout.contains("cua-driver") ? .ok : .missing
+        guard !installed.isEmpty else { return .missing }
+
+        for engine in installed {
+            let registered = await isCuaRegistered(with: engine)
+            if !registered { return .missing }
+        }
+        return .ok
+    }
+
+    private func isCuaRegistered(with engine: RunnerEngine) async -> Bool {
+        let result = await Shell.run(engine.locateBinary(), ["mcp", "list"])
+        guard result.exitCode == 0 else { return false }
+        return result.stdout.contains("cua-driver")
     }
 
     // MARK: - Fix actions
@@ -94,7 +139,6 @@ final class PrereqsChecker: ObservableObject {
     func requestVoice() async {
         state.voice = .checking
 
-        // If already denied, can't re-prompt — point user at Settings.
         if AVCaptureDevice.authorizationStatus(for: .audio) == .denied {
             openMicrophoneSettings()
             state.voice = await checkVoice()
@@ -132,8 +176,9 @@ final class PrereqsChecker: ObservableObject {
         }
     }
 
-    /// Installs the cua-driver binary if missing and registers it as an MCP plugin.
-    /// Returns true on success.
+    /// Installs the cua-driver binary if missing and registers it with every
+    /// engine the user has installed. Re-running is safe — idempotent on the
+    /// "already exists" stderr response from each engine's `mcp add`.
     func installComputerAccess() async -> Bool {
         if !FileManager.default.isExecutableFile(atPath: cuaDriverPath) {
             state.computer = .checking
@@ -143,11 +188,25 @@ final class PrereqsChecker: ObservableObject {
                 return false
             }
         }
-        // Register with claude.
-        let register = await Shell.run(claudePath, ["mcp", "add", "cua-driver", "--", cuaDriverPath, "mcp"])
-        if register.exitCode != 0 && !register.stderr.contains("already exists") {
-            state.computer = .failed(register.stderr.isEmpty ? "Registration failed" : register.stderr)
+
+        let installed = RunnerEngine.allCases.filter {
+            FileManager.default.isExecutableFile(atPath: $0.locateBinary())
+        }
+        guard !installed.isEmpty else {
+            state.computer = .failed("Install at least one AI engine first.")
             return false
+        }
+
+        for engine in installed {
+            if await isCuaRegistered(with: engine) { continue }
+            let register = await Shell.run(
+                engine.locateBinary(),
+                ["mcp", "add", "cua-driver", "--", cuaDriverPath, "mcp"]
+            )
+            if register.exitCode != 0 && !register.stderr.contains("already exists") {
+                state.computer = .failed("Could not register with \(engine.displayName): \(register.stderr)")
+                return false
+            }
         }
         state.computer = .ok
         return true
@@ -162,7 +221,6 @@ enum Shell {
         let stderr: String
     }
 
-    /// Run a command at an absolute path with explicit args. No shell, no escaping concerns.
     static func run(_ executable: String, _ args: [String]) async -> Result {
         await withCheckedContinuation { (cont: CheckedContinuation<Result, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -194,12 +252,10 @@ enum Shell {
         }
     }
 
-    /// Run a full shell command line via /bin/zsh -lc. Use sparingly — prefer the args form.
     static func runShell(_ commandLine: String) async -> Result {
         await run("/bin/zsh", ["-lc", commandLine])
     }
 
-    /// Fire-and-forget AppleScript (used to open Terminal for the user to log in).
     static func runAppleScriptDetached(_ source: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")

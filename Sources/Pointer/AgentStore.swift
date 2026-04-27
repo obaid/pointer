@@ -80,9 +80,13 @@ struct ActiveTask: Identifiable, Codable {
     let startedAt: Date
     var state: TaskState
     var activity: [ActivityEvent]
-    /// Claude session ID, captured from the first stream event. Used to resume the
-    /// conversation when the user sends a follow-up reply.
+    /// Engine-specific session ID (Claude session_id, Codex thread_id).
+    /// Captured from the first stream event. Used to resume the conversation
+    /// when the user sends a follow-up reply.
     var sessionId: String?
+    /// Which CLI ran this task. Determines the runner + parser used both for
+    /// the initial run and any follow-ups. Persisted so history reflects it.
+    var engine: RunnerEngine
     /// Last time the task transitioned to a terminal state. Used for the
     /// duration column in History; nil while still running.
     var endedAt: Date?
@@ -94,6 +98,7 @@ struct ActiveTask: Identifiable, Codable {
         state: TaskState = .running,
         activity: [ActivityEvent] = [],
         sessionId: String? = nil,
+        engine: RunnerEngine = .claude,
         endedAt: Date? = nil
     ) {
         self.id = id
@@ -102,7 +107,22 @@ struct ActiveTask: Identifiable, Codable {
         self.state = state
         self.activity = activity
         self.sessionId = sessionId
+        self.engine = engine
         self.endedAt = endedAt
+    }
+
+    /// Custom decoder so older history entries (written before the engine
+    /// field existed) still decode — they default to .claude.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(UUID.self, forKey: .id)
+        self.prompt = try c.decode(String.self, forKey: .prompt)
+        self.startedAt = try c.decode(Date.self, forKey: .startedAt)
+        self.state = try c.decode(TaskState.self, forKey: .state)
+        self.activity = try c.decode([ActivityEvent].self, forKey: .activity)
+        self.sessionId = try c.decodeIfPresent(String.self, forKey: .sessionId)
+        self.engine = try c.decodeIfPresent(RunnerEngine.self, forKey: .engine) ?? .claude
+        self.endedAt = try c.decodeIfPresent(Date.self, forKey: .endedAt)
     }
 
     var latestActivity: ActivityEvent? { activity.last }
@@ -173,40 +193,59 @@ final class AgentStore: ObservableObject {
 
     // MARK: - User actions
 
-    /// Spawn a new agent for `prompt`. Returns false (no-op) if at capacity.
+    /// Spawn a new agent for `prompt` on `engine`. Returns false (no-op) if
+    /// at capacity. Engine defaults to the user's saved preference.
     @discardableResult
-    func submit(prompt: String) -> Bool {
+    func submit(prompt: String, engine: RunnerEngine = EnginePreference.current) -> Bool {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         guard canAcceptNewTask else { return false }
 
-        let new = ActiveTask(prompt: trimmed, startedAt: Date())
+        let new = ActiveTask(prompt: trimmed, startedAt: Date(), engine: engine)
         tasks.insert(new, at: 0)
-        appendActivity(.init(kind: .info, text: "Starting agent...", detail: nil), for: new.id)
+        appendActivity(.init(kind: .info, text: "Starting \(engine.displayName)...", detail: nil), for: new.id)
 
         let taskId = new.id
         let handle = Task { @MainActor [weak self] in
-            await ClaudeAgentRunner.run(prompt: trimmed, resumeSessionId: nil, taskId: taskId, store: self)
+            await Self.dispatchRun(engine: engine, prompt: trimmed, resumeSessionId: nil, taskId: taskId, store: self)
         }
         handles[taskId] = handle
         return true
     }
 
-    /// Continue task `taskId` with a follow-up reply (resumes the same Claude session).
+    /// Continue task `taskId` with a follow-up reply (resumes the same engine session).
     func followUp(taskId: UUID, reply: String) {
         let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               let idx = tasks.firstIndex(where: { $0.id == taskId }),
               let sessionId = tasks[idx].sessionId else { return }
 
+        let engine = tasks[idx].engine
         tasks[idx].state = .running
         tasks[idx].endedAt = nil
         appendActivity(.init(kind: .info, text: "→ \(trimmed)", detail: nil), for: taskId)
 
         let handle = Task { @MainActor [weak self] in
-            await ClaudeAgentRunner.run(prompt: trimmed, resumeSessionId: sessionId, taskId: taskId, store: self)
+            await Self.dispatchRun(engine: engine, prompt: trimmed, resumeSessionId: sessionId, taskId: taskId, store: self)
         }
         handles[taskId] = handle
+    }
+
+    /// Picks the right runner for `engine`. Each runner has the same shape:
+    /// spawn the CLI, stream its NDJSON, write events back to `store`, finish.
+    private static func dispatchRun(
+        engine: RunnerEngine,
+        prompt: String,
+        resumeSessionId: String?,
+        taskId: UUID,
+        store: AgentStore?
+    ) async {
+        switch engine {
+        case .claude:
+            await ClaudeAgentRunner.run(prompt: prompt, resumeSessionId: resumeSessionId, taskId: taskId, store: store)
+        case .codex:
+            await CodexAgentRunner.run(prompt: prompt, resumeSessionId: resumeSessionId, taskId: taskId, store: store)
+        }
     }
 
     /// Terminate the agent process for `taskId` and mark the task cancelled.

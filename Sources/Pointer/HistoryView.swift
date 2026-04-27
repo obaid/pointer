@@ -98,6 +98,7 @@ private struct HistoryRow: View {
                     .foregroundStyle(.primary)
                     .lineLimit(2)
                 HStack(spacing: 6) {
+                    EngineBadge(engine: task.engine, compact: true)
                     Text(task.startedAt, style: .relative)
                         .font(.system(size: 10))
                     Text("·").foregroundStyle(.tertiary)

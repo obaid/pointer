@@ -72,7 +72,8 @@ private struct CollapsedCard: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            Spacer(minLength: 0)
+            Spacer(minLength: 4)
+            EngineBadge(engine: task.engine, compact: true)
             trailing
         }
         .padding(.horizontal, 14)
@@ -233,6 +234,7 @@ private struct ExpandedCard: View {
                 .font(.system(size: 12, weight: .semibold))
                 .lineLimit(1)
             Spacer()
+            EngineBadge(engine: task.engine, compact: true)
             Button(action: { store.expandedTaskId = nil }) {
                 Image(systemName: "chevron.up")
                     .font(.system(size: 11, weight: .semibold))

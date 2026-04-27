@@ -4,22 +4,16 @@ struct OnboardingView: View {
     @ObservedObject var checker: PrereqsChecker
     let onFinish: () -> Void
 
+    /// Picked default engine for new tasks. Initialized from the saved
+    /// preference and saved back on Continue.
+    @State private var defaultEngine: RunnerEngine = EnginePreference.current
+
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.4)
             VStack(alignment: .leading, spacing: 14) {
-                StepRow(
-                    title: "AI engine",
-                    subtitle: "Powers the agents that handle your tasks.",
-                    status: checker.state.aiEngine,
-                    primaryActionLabel: actionLabel(for: checker.state.aiEngine, missing: "Install"),
-                    primaryAction: {
-                        if let url = URL(string: "https://claude.com/product/claude-code") {
-                            NSWorkspace.shared.open(url)
-                        }
-                    }
-                )
+                AIEngineStep(checker: checker, defaultEngine: $defaultEngine)
                 StepRow(
                     title: "Computer access",
                     subtitle: "Lets Pointer click, type, and read your apps.",
@@ -48,6 +42,14 @@ struct OnboardingView: View {
         .frame(width: 520)
         .background(.regularMaterial)
         .task { await checker.runAllChecks() }
+        // Keep the @State default in sync with available engines: if the
+        // user uninstalls the saved-preference engine, fall back to the first
+        // installed one so Continue saves something useful.
+        .onChange(of: checker.state.installedEngines) { _, installed in
+            if !installed.contains(defaultEngine), let first = installed.first {
+                defaultEngine = first
+            }
+        }
     }
 
     private var header: some View {
@@ -82,10 +84,13 @@ struct OnboardingView: View {
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
             Spacer()
-            Button("Continue", action: onFinish)
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(!checker.state.allReady)
+            Button("Continue") {
+                EnginePreference.current = defaultEngine
+                onFinish()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .disabled(!checker.state.allReady)
         }
         .padding(.horizontal, 22)
         .padding(.vertical, 16)
@@ -96,6 +101,148 @@ struct OnboardingView: View {
         case .missing: return missing
         case .failed: return "Retry"
         default: return ""
+        }
+    }
+}
+
+/// AI engine step. Lists all supported engines; user installs at least one
+/// and (when 2+ are installed) picks a default for new tasks.
+private struct AIEngineStep: View {
+    @ObservedObject var checker: PrereqsChecker
+    @Binding var defaultEngine: RunnerEngine
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 14) {
+                statusBadge.frame(width: 22).padding(.top, 2)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("AI engines").font(.system(size: 14, weight: .semibold))
+                    Text(subtitle)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            VStack(spacing: 6) {
+                ForEach(RunnerEngine.allCases) { engine in
+                    EngineRow(
+                        engine: engine,
+                        status: checker.state.engines[engine] ?? .unknown,
+                        isDefault: defaultEngine == engine,
+                        canBeDefault: (checker.state.engines[engine] ?? .unknown).isResolved,
+                        onPickDefault: { defaultEngine = engine }
+                    )
+                }
+            }
+            .padding(.leading, 36)
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.quaternary.opacity(0.4))
+        )
+    }
+
+    private var subtitle: String {
+        switch checker.state.installedEngines.count {
+        case 0: return "Install at least one to run Pointer."
+        case 1: return "Pointer is ready. Install the other to switch between them per task."
+        default: return "Both installed — pick which one runs new tasks by default."
+        }
+    }
+
+    @ViewBuilder
+    private var statusBadge: some View {
+        if checker.state.installedEngines.isEmpty {
+            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
+        } else {
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        }
+    }
+}
+
+private struct EngineRow: View {
+    let engine: RunnerEngine
+    let status: PrereqsChecker.CheckStatus
+    let isDefault: Bool
+    let canBeDefault: Bool
+    let onPickDefault: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            statusIcon.frame(width: 16)
+            Image(systemName: engine.symbolName)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            Text(engine.displayName)
+                .font(.system(size: 12, weight: .medium))
+            Spacer()
+            trailing
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.quaternary.opacity(0.30))
+        )
+    }
+
+    @ViewBuilder
+    private var trailing: some View {
+        switch status {
+        case .ok:
+            if canBeDefault {
+                Button(action: onPickDefault) {
+                    HStack(spacing: 4) {
+                        Image(systemName: isDefault ? "circle.inset.filled" : "circle")
+                            .foregroundStyle(isDefault ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
+                        Text("Default")
+                            .font(.system(size: 11))
+                            .foregroundStyle(isDefault ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary))
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(isDefault)
+                .help(isDefault ? "This is your default engine" : "Use \(engine.displayName) by default")
+            }
+        case .missing:
+            Button("Install") {
+                if let url = engine.installURL {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            .controlSize(.small)
+        case .failed(let msg):
+            VStack(alignment: .trailing, spacing: 2) {
+                Button("Install") {
+                    if let url = engine.installURL {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+                .controlSize(.small)
+                Text(msg.prefix(40))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+        case .checking:
+            ProgressView().controlSize(.small)
+        case .unknown:
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder
+    private var statusIcon: some View {
+        switch status {
+        case .unknown:
+            Image(systemName: "circle.dotted").foregroundStyle(.tertiary)
+        case .checking:
+            ProgressView().controlSize(.small)
+        case .ok:
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .missing, .failed:
+            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
         }
     }
 }

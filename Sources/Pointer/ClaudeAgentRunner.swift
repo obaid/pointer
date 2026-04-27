@@ -2,14 +2,13 @@ import Foundation
 
 /// Spawns Claude Code (`claude -p --output-format stream-json --verbose`) and
 /// streams NDJSON events into the AgentStore as they arrive. Owns the Process
-/// reference so AgentStore.cancel() can terminate the run.
+/// reference so AgentStore.cancel(taskId:) can terminate the run.
 enum ClaudeAgentRunner {
-    private static let claudePath: String = ClaudeBinary.locate()
-
     static func run(prompt: String, resumeSessionId: String?, taskId: UUID, store: AgentStore?) async {
+        let claudePath = ClaudeBinary.locate()
         guard let store else { return }
 
-        let workspace = ensureWorkspaceDir()
+        let workspace = AgentWorkspace.ensure()
         NSLog("🤖 ClaudeAgentRunner.run prompt=\(prompt.prefix(80)) resume=\(resumeSessionId ?? "<new>")")
 
         let process = Process()
@@ -55,7 +54,7 @@ enum ClaudeAgentRunner {
         do {
             for try await line in stdoutHandle.bytes.lines {
                 if Task.isCancelled { break }
-                let parsed = StreamEventParser.parse(line: line)
+                let parsed = ClaudeStreamEventParser.parse(line: line)
                 if let sid = parsed.sessionId {
                     await store.setSessionId(sid, for: taskId)
                 }
@@ -98,8 +97,13 @@ enum ClaudeAgentRunner {
         }
         await store.finish(taskId: taskId, state: finalState)
     }
+}
 
-    private static func ensureWorkspaceDir() -> URL {
+/// The directory both engines run in. ~/pointer-workspace — outside of any
+/// project so per-engine settings (codex's trust_level, claude's CWD-scoped
+/// permissions) don't pollute the user's real repos.
+enum AgentWorkspace {
+    static func ensure() -> URL {
         let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("pointer-workspace")
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url

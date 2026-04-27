@@ -11,6 +11,9 @@ struct CommandBarView: View {
     /// Briefly true when the user tries to submit at the concurrency cap.
     /// Drives the "all slots full" inline warning.
     @State private var capacityWarning: Bool = false
+    /// Engine for THIS submission. Defaults to the saved preference and
+    /// writes back on submit so the choice sticks across launches.
+    @State private var engine: RunnerEngine = EnginePreference.current
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -36,9 +39,7 @@ struct CommandBarView: View {
                     .padding(.leading, 30)
                     .lineLimit(2)
             }
-            if store.runningCount > 0 || capacityWarning {
-                slotIndicator
-            }
+            helperRow
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 14)
@@ -130,9 +131,40 @@ struct CommandBarView: View {
         if dictator.isRecording {
             Task { await dictator.stop() }
         }
-        store.submit(prompt: prompt)
+        EnginePreference.current = engine
+        store.submit(prompt: prompt, engine: engine)
         text = ""
         onSubmit()
+    }
+
+    /// Bottom row: slot indicator on the left, engine picker on the right.
+    /// The row is always present (so the layout doesn't jump when slots
+    /// appear) but hides individual elements when there's nothing to show.
+    @ViewBuilder
+    private var helperRow: some View {
+        let showSlots = store.runningCount > 0 || capacityWarning
+        if showSlots || shouldShowEnginePicker {
+            HStack(spacing: 8) {
+                if showSlots {
+                    slotIndicator
+                } else {
+                    Spacer(minLength: 0)
+                }
+                EnginePicker(selection: $engine)
+            }
+            .padding(.leading, 30)
+            .padding(.top, 2)
+        }
+    }
+
+    /// Whether the engine picker should appear. Hidden when only one engine
+    /// is installed (no choice to make). Cheap probe — re-evaluated on every
+    /// render so newly-installed engines show up without needing a restart.
+    private var shouldShowEnginePicker: Bool {
+        let installed = RunnerEngine.allCases.filter {
+            FileManager.default.isExecutableFile(atPath: $0.locateBinary())
+        }
+        return installed.count > 1
     }
 
     /// Five small pips + an N/5 label. Fills left-to-right with the current
@@ -160,8 +192,6 @@ struct CommandBarView: View {
                 .lineLimit(1)
             Spacer(minLength: 0)
         }
-        .padding(.leading, 30)
-        .padding(.top, 2)
     }
 }
 

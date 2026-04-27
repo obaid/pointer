@@ -33,16 +33,42 @@ enum CuaDriverBinary {
     }
 }
 
-/// Resolves a CLI tool's path: probes a list of common locations, then falls
-/// back to `which`. Returns the first existing executable, or — if nothing is
-/// found — the first candidate so existence checks elsewhere surface a clean
-/// "missing" state rather than crashing on an empty path.
+/// Resolves a CLI tool's path. Tries (in order):
+///   1. Each commonPaths entry — fast file-system check.
+///   2. `/usr/bin/env which TOOL` — uses the inherited PATH.
+///   3. `/bin/zsh -ilc 'command -v TOOL'` — interactive login shell, sources
+///      .zprofile and .zshrc so tools managed by nvm/asdf/fnm/Homebrew shell
+///      hooks resolve. Slower, so cached.
+/// Returns commonPaths[0] when nothing is found, so callers' existence
+/// checks surface a clean "missing" state rather than crashing on "".
 enum BinaryResolver {
+    private static var cache: [String: String] = [:]
+    private static let lock = NSLock()
+
     static func locate(tool: String, commonPaths: [String]) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = cache[tool] { return cached }
+        let resolved = resolveFresh(tool: tool, commonPaths: commonPaths)
+        cache[tool] = resolved
+        NSLog("🔧 BinaryResolver: \(tool) -> \(resolved)")
+        return resolved
+    }
+
+    /// Drops the cache so the next locate() re-probes. Use after an install
+    /// step so newly-installed binaries become visible without an app restart.
+    static func invalidateCache() {
+        lock.lock()
+        cache.removeAll()
+        lock.unlock()
+    }
+
+    private static func resolveFresh(tool: String, commonPaths: [String]) -> String {
         for path in commonPaths where FileManager.default.isExecutableFile(atPath: path) {
             return path
         }
         if let onPath = which(tool) { return onPath }
+        if let onShellPath = shellWhich(tool) { return onShellPath }
         return commonPaths[0]
     }
 
@@ -58,6 +84,29 @@ enum BinaryResolver {
         process.waitUntilExit()
         guard process.terminationStatus == 0 else { return nil }
         let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return path.isEmpty ? nil : path
+        guard !path.isEmpty, FileManager.default.isExecutableFile(atPath: path) else { return nil }
+        return path
+    }
+
+    /// Interactive login shell lookup. Loads .zprofile + .zshrc so nvm /
+    /// asdf-managed tools resolve. Multi-line output is filtered to the last
+    /// non-empty line (interactive shells sometimes emit prompts/banners).
+    private static func shellWhich(_ tool: String) -> String? {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-ilc", "command -v \(tool)"]
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do { try process.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        let raw = String(data: data, encoding: .utf8) ?? ""
+        // Take the LAST non-empty line — banners/prompts emit before our output.
+        let candidate = raw.split(separator: "\n").last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+            .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+        guard !candidate.isEmpty, FileManager.default.isExecutableFile(atPath: candidate) else { return nil }
+        return candidate
     }
 }
