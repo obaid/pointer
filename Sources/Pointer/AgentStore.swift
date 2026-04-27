@@ -113,10 +113,9 @@ struct ActiveTask: Identifiable, Codable {
     }
 
     /// Best-effort detection that the agent finished a turn but is asking
-    /// the user a question rather than reporting a complete result. Used to
-    /// switch the orb's status dot to amber + auto-expand the panel.
-    /// Heuristic — false negatives are safe; we'd rather miss a prompt than
-    /// nag the user when the agent actually finished.
+    /// the user a question rather than reporting a complete result. Drives
+    /// the amber dot + auto-expand. False negatives are safe; we'd rather
+    /// miss a prompt than nag the user when the agent actually finished.
     var awaitingReply: Bool {
         guard canFollowUp else { return false }
         guard case .done(let summary) = state else { return false }
@@ -136,117 +135,139 @@ struct ActiveTask: Identifiable, Codable {
 final class AgentStore: ObservableObject {
     static let shared = AgentStore()
 
-    @Published private(set) var task: ActiveTask?
+    /// Cap on concurrent running agents. New submissions are rejected when
+    /// `runningCount` reaches this limit.
+    static let maxConcurrent = 5
 
-    /// Whether the orb is expanded into the full panel. UI-only state; lives here so
-    /// AppDelegate can observe via Combine and resize the NSPanel without rebuilding the
-    /// hosted SwiftUI view.
-    @Published var orbExpanded: Bool = false
+    /// All tasks currently displayed in the orb stack, most-recent-first.
+    /// Removed only on explicit user dismiss — even after a task finishes,
+    /// it stays in the stack so the user can read the result and follow up.
+    @Published private(set) var tasks: [ActiveTask] = []
+
+    /// At most one task can be expanded at a time. nil = all collapsed.
+    @Published var expandedTaskId: UUID? = nil
 
     /// One-shot signal: AppDelegate sets this to true before showing the command bar
     /// when the user invoked the global voice hotkey. CommandBarView observes it and
     /// auto-starts dictation, then resets the flag.
     @Published var pendingAutoVoice: Bool = false
 
-    /// True while a task is in flight. Drives menu bar animation + orb visibility.
-    var isRunning: Bool {
-        guard let t = task else { return false }
-        if case .running = t.state { return true }
-        return false
-    }
-
-    private var activeProcess: Process?
-    private var runHandle: Task<Void, Never>?
+    private var processes: [UUID: Process] = [:]
+    private var handles: [UUID: Task<Void, Never>] = [:]
 
     private init() {}
 
-    func submit(prompt: String) {
-        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+    // MARK: - Derived state
 
-        // Cancel anything in flight.
-        if isRunning { cancel() }
+    var runningCount: Int {
+        tasks.reduce(0) { count, task in
+            if case .running = task.state { return count + 1 }
+            return count
+        }
+    }
+    var anyRunning: Bool { runningCount > 0 }
+    var anyAwaitingReply: Bool { tasks.contains { $0.awaitingReply } }
+    var canAcceptNewTask: Bool { runningCount < Self.maxConcurrent }
+
+    func task(id: UUID) -> ActiveTask? { tasks.first { $0.id == id } }
+
+    // MARK: - User actions
+
+    /// Spawn a new agent for `prompt`. Returns false (no-op) if at capacity.
+    @discardableResult
+    func submit(prompt: String) -> Bool {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        guard canAcceptNewTask else { return false }
 
         let new = ActiveTask(prompt: trimmed, startedAt: Date())
-        task = new
-        appendActivity(.init(kind: .info, text: "Starting agent...", detail: nil))
+        tasks.insert(new, at: 0)
+        appendActivity(.init(kind: .info, text: "Starting agent...", detail: nil), for: new.id)
 
         let taskId = new.id
-        runHandle = Task { @MainActor [weak self] in
+        let handle = Task { @MainActor [weak self] in
             await ClaudeAgentRunner.run(prompt: trimmed, resumeSessionId: nil, taskId: taskId, store: self)
         }
+        handles[taskId] = handle
+        return true
     }
 
-    /// Continue the current task with a follow-up message in the same Claude session.
-    func followUp(reply: String) {
+    /// Continue task `taskId` with a follow-up reply (resumes the same Claude session).
+    func followUp(taskId: UUID, reply: String) {
         let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
-              var current = task,
-              let sessionId = current.sessionId
-        else { return }
+              let idx = tasks.firstIndex(where: { $0.id == taskId }),
+              let sessionId = tasks[idx].sessionId else { return }
 
-        // Mark as running again; keep the activity log so the user sees the full thread.
-        current.state = .running
-        current.endedAt = nil
-        task = current
+        tasks[idx].state = .running
+        tasks[idx].endedAt = nil
+        appendActivity(.init(kind: .info, text: "→ \(trimmed)", detail: nil), for: taskId)
 
-        appendActivity(.init(kind: .info, text: "→ \(trimmed)", detail: nil))
-
-        let taskId = current.id
-        runHandle = Task { @MainActor [weak self] in
+        let handle = Task { @MainActor [weak self] in
             await ClaudeAgentRunner.run(prompt: trimmed, resumeSessionId: sessionId, taskId: taskId, store: self)
         }
+        handles[taskId] = handle
     }
 
-    func setSessionId(_ id: String, for taskId: UUID) {
-        guard var t = task, t.id == taskId, t.sessionId == nil else { return }
-        t.sessionId = id
-        task = t
-    }
-
-    func cancel() {
-        activeProcess?.terminate()
-        runHandle?.cancel()
-        if var t = task, case .running = t.state {
-            t.state = .cancelled
-            t.endedAt = Date()
-            task = t
+    /// Terminate the agent process for `taskId` and mark the task cancelled.
+    /// Leaves the task in the stack so the user can read what happened.
+    func cancel(taskId: UUID) {
+        processes[taskId]?.terminate()
+        handles[taskId]?.cancel()
+        guard let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return }
+        if case .running = tasks[idx].state {
+            tasks[idx].state = .cancelled
+            tasks[idx].endedAt = Date()
+            HistoryStore.shared.record(tasks[idx])
         }
-        appendActivity(.init(kind: .warning, text: "Cancelled", detail: nil))
-        if let t = task { HistoryStore.shared.record(t) }
+        appendActivity(.init(kind: .warning, text: "Cancelled", detail: nil), for: taskId)
     }
 
-    func dismiss() {
-        guard !isRunning else { return }
-        task = nil
-        orbExpanded = false
+    func cancelAll() {
+        for task in tasks where !task.isTerminal {
+            cancel(taskId: task.id)
+        }
+    }
+
+    /// Remove a task from the stack. Cancels first if it's still running.
+    func dismiss(taskId: UUID) {
+        if let idx = tasks.firstIndex(where: { $0.id == taskId }), !tasks[idx].isTerminal {
+            cancel(taskId: taskId)
+        }
+        tasks.removeAll { $0.id == taskId }
+        processes.removeValue(forKey: taskId)
+        handles.removeValue(forKey: taskId)
+        if expandedTaskId == taskId { expandedTaskId = nil }
     }
 
     // MARK: - Runner-facing API
 
     func registerProcess(_ process: Process, for taskId: UUID) {
-        guard task?.id == taskId else { return }
-        activeProcess = process
+        guard tasks.contains(where: { $0.id == taskId }) else { return }
+        processes[taskId] = process
     }
 
-    func appendActivity(_ event: ActivityEvent, for taskId: UUID? = nil) {
-        guard var t = task, taskId == nil || t.id == taskId else { return }
-        t.activity.append(event)
-        task = t
+    func appendActivity(_ event: ActivityEvent, for taskId: UUID) {
+        guard let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return }
+        tasks[idx].activity.append(event)
+    }
+
+    func setSessionId(_ id: String, for taskId: UUID) {
+        guard let idx = tasks.firstIndex(where: { $0.id == taskId }), tasks[idx].sessionId == nil else { return }
+        tasks[idx].sessionId = id
     }
 
     func finish(taskId: UUID, state: TaskState) {
-        guard var t = task, t.id == taskId else { return }
-        t.state = state
-        t.endedAt = Date()
-        task = t
-        activeProcess = nil
-        HistoryStore.shared.record(t)
-        // If the agent is asking the user something and the orb is collapsed,
-        // pop it open so the question is visible. Doesn't fire if the user
-        // already has the panel expanded.
-        if t.awaitingReply, !orbExpanded {
-            orbExpanded = true
+        guard let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return }
+        tasks[idx].state = state
+        tasks[idx].endedAt = Date()
+        processes.removeValue(forKey: taskId)
+        handles.removeValue(forKey: taskId)
+        HistoryStore.shared.record(tasks[idx])
+        // Auto-expand if this task is asking the user something and nothing
+        // is currently expanded — so the question is visible immediately.
+        if tasks[idx].awaitingReply, expandedTaskId == nil {
+            expandedTaskId = taskId
         }
     }
 }

@@ -8,6 +8,9 @@ struct CommandBarView: View {
     @State private var text: String = ""
     @StateObject private var dictator = Dictator()
     @FocusState private var focused: Bool
+    /// Briefly true when the user tries to submit at the concurrency cap.
+    /// Drives the "all slots full" inline warning.
+    @State private var capacityWarning: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -32,6 +35,9 @@ struct CommandBarView: View {
                     .foregroundStyle(dictator.isRecording ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.red))
                     .padding(.leading, 30)
                     .lineLimit(2)
+            }
+            if store.runningCount > 0 || capacityWarning {
+                slotIndicator
             }
         }
         .padding(.horizontal, 18)
@@ -112,12 +118,50 @@ struct CommandBarView: View {
     private func submit() {
         let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return }
+        guard store.canAcceptNewTask else {
+            // Capacity reached — flash a warning and keep the bar open so the
+            // user sees it. Auto-clears in 3s.
+            withAnimation { capacityWarning = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                withAnimation { capacityWarning = false }
+            }
+            return
+        }
         if dictator.isRecording {
             Task { await dictator.stop() }
         }
         store.submit(prompt: prompt)
         text = ""
         onSubmit()
+    }
+
+    /// Five small pips + an N/5 label. Fills left-to-right with the current
+    /// running-task count. Flashes orange when the user hits the cap.
+    private var slotIndicator: some View {
+        let n = store.runningCount
+        let max = AgentStore.maxConcurrent
+        let warning = capacityWarning
+        let labelColor: AnyShapeStyle = warning
+            ? AnyShapeStyle(Color.orange)
+            : AnyShapeStyle(.tertiary)
+        return HStack(spacing: 5) {
+            HStack(spacing: 4) {
+                ForEach(0..<max, id: \.self) { i in
+                    Circle()
+                        .fill(i < n ? Color.accentColor : Color.secondary.opacity(0.22))
+                        .frame(width: 5, height: 5)
+                }
+            }
+            Text(warning
+                 ? "All \(max) slots full — finish or cancel one to launch another"
+                 : "\(n)/\(max) agents active")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(labelColor)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 30)
+        .padding(.top, 2)
     }
 }
 

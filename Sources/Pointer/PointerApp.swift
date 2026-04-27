@@ -19,16 +19,16 @@ struct PointerApp: App {
     }
 }
 
-/// MenuBarExtra label. Variable-color shimmer while a task is running OR
-/// the agent is awaiting a reply, with an amber tint in the awaiting case so
-/// the user notices even with the orb offscreen.
+/// MenuBarExtra label. Variable-color shimmer while ANY task is running OR
+/// awaiting a reply, with an amber tint in the awaiting case so the user
+/// notices even with the orb offscreen.
 struct MenuBarLabel: View {
     @ObservedObject var store: AgentStore
 
     var body: some View {
-        let awaiting = store.task?.awaitingReply ?? false
+        let awaiting = store.anyAwaitingReply
         Image(systemName: "cursorarrow.rays")
-            .symbolEffect(.variableColor.iterative.reversing, isActive: store.isRunning || awaiting)
+            .symbolEffect(.variableColor.iterative.reversing, isActive: store.anyRunning || awaiting)
             .foregroundStyle(awaiting ? AnyShapeStyle(Color.yellow) : AnyShapeStyle(.primary))
     }
 }
@@ -40,9 +40,12 @@ struct MenuBarMenu: View {
     var body: some View {
         Button("New Task...", action: openCommandBar)
             .keyboardShortcut("n")
-        if store.isRunning {
-            Button("Cancel current task") { store.cancel() }
-                .keyboardShortcut(".", modifiers: .command)
+        if store.anyRunning {
+            let n = store.runningCount
+            Button(n == 1 ? "Cancel running task" : "Cancel \(n) running tasks") {
+                store.cancelAll()
+            }
+            .keyboardShortcut(".", modifiers: .command)
         }
         Divider()
         Button("History...") { AppDelegate.shared?.showHistory() }
@@ -92,36 +95,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Store observation: drive orb visibility
 
     private func observeStore() {
-        AgentStore.shared.$task
+        AgentStore.shared.$tasks
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] task in
-                self?.reconcileOrb(task: task)
+            .sink { [weak self] tasks in
+                self?.reconcileOrb(tasks: tasks)
+                self?.positionOrb()
             }
             .store(in: &cancellables)
 
-        AgentStore.shared.$orbExpanded
+        AgentStore.shared.$expandedTaskId
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] expanded in
+            .sink { [weak self] expandedId in
                 guard let self else { return }
                 self.positionOrb()
-                if expanded {
-                    // Becoming key lets the in-panel text field receive keystrokes
-                    // for follow-up replies. .nonactivatingPanel keeps the user's
-                    // foreground app from being deactivated.
+                if expandedId != nil {
+                    // Becoming key lets the in-panel reply field receive keystrokes.
+                    // .nonactivatingPanel keeps the user's foreground app from
+                    // being deactivated.
                     self.orbWindow?.makeKey()
                 }
             }
             .store(in: &cancellables)
     }
 
-    private func reconcileOrb(task: ActiveTask?) {
-        guard task != nil else {
+    private func reconcileOrb(tasks: [ActiveTask]) {
+        if tasks.isEmpty {
             hideOrb()
-            return
+        } else {
+            showOrb()
         }
-        showOrb()
-        // No auto-dismiss: user needs to read the result. Orb persists until they
-        // explicitly dismiss it or submit another task.
     }
 
     // MARK: - Command bar
@@ -201,14 +203,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func hideOrb() {
         orbWindow?.orderOut(nil)
-        AgentStore.shared.orbExpanded = false
+        AgentStore.shared.expandedTaskId = nil
     }
 
-    /// Builds the orb panel exactly once. SwiftUI inside reacts to AgentStore.orbExpanded;
+    /// Builds the orb panel exactly once. SwiftUI inside reacts to the AgentStore;
     /// AppDelegate only resizes the panel to match. The hosting view is never rebuilt.
     private func makeOrbWindow() -> KeyableOrbPanel {
         let panel = KeyableOrbPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 360, height: 480),
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 56),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -223,31 +225,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let host = NSHostingView(
             rootView: OrbView(
                 store: AgentStore.shared,
-                onClose: { [weak self] in
-                    AgentStore.shared.dismiss()
-                    self?.hideOrb()
+                onDismiss: { taskId in
+                    AgentStore.shared.dismiss(taskId: taskId)
+                    // hideOrb fires automatically via $tasks observer when the
+                    // last card is removed.
                 }
             )
         )
-        host.frame = NSRect(x: 0, y: 0, width: 360, height: 480)
+        host.frame = NSRect(x: 0, y: 0, width: 360, height: 56)
         panel.contentView = host
         return panel
     }
 
-    /// Resizes and re-anchors the orb panel for the current expand state.
-    /// No animation — see crash forensics in feedback memory.
+    /// Resizes and re-anchors the orb panel based on the current task stack.
+    /// Computes height deterministically from task count + expanded state —
+    /// avoids a PreferenceKey round-trip for every activity event. No
+    /// animation (see crash forensics).
     private func positionOrb() {
         guard let panel = orbWindow, let screen = NSScreen.main else { return }
         let f = screen.visibleFrame
-        let expanded = AgentStore.shared.orbExpanded
-        let size: NSSize = expanded ? NSSize(width: 360, height: 480) : NSSize(width: 280, height: 56)
+        let size = computeOrbPanelSize(screen: screen)
         let rightInset: CGFloat = 16
         let topInset: CGFloat = 12
         let origin = NSPoint(
             x: f.maxX - size.width - rightInset,
             y: f.maxY - size.height - topInset
         )
-        panel.setFrame(NSRect(origin: origin, size: size), display: true, animate: false)
+        // No-op if frame is unchanged — many @Published changes (e.g. activity
+        // appends) don't change size. Compare origin too: the panel is created
+        // at (0,0) and the first reposition must succeed even though size
+        // matches the initial 360×56.
+        let newFrame = NSRect(origin: origin, size: size)
+        if panel.frame == newFrame { return }
+        panel.setFrame(newFrame, display: true, animate: false)
+    }
+
+    private func computeOrbPanelSize(screen: NSScreen) -> NSSize {
+        let store = AgentStore.shared
+        let count = store.tasks.count
+        let hasExpanded = store.expandedTaskId != nil
+        let collapsedH: CGFloat = 56
+        let expandedH: CGFloat = 480
+        let spacing: CGFloat = 8
+
+        let height: CGFloat
+        if count == 0 {
+            height = collapsedH
+        } else if hasExpanded {
+            let collapsedCount = max(0, count - 1)
+            height = expandedH + CGFloat(collapsedCount) * (collapsedH + spacing)
+        } else {
+            height = CGFloat(count) * collapsedH + CGFloat(max(0, count - 1)) * spacing
+        }
+        let maxH = screen.visibleFrame.height - 36
+        return NSSize(width: 360, height: min(height, maxH))
     }
 
     // MARK: - History

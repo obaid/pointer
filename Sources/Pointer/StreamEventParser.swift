@@ -76,7 +76,13 @@ enum StreamEventParser {
                     if isError {
                         headline = raw.isEmpty ? "Tool error" : "Tool error: \(condense(raw))"
                     } else {
-                        headline = raw.isEmpty ? "Tool returned" : raw
+                        // Successful results sometimes carry inline ⚠ hint text
+                        // (e.g. cua-driver: "⚠ Screenshot is 1568px wide. Use
+                        // `zoom`..."). The green checkmark already conveys
+                        // success — drop the alarm glyph so it doesn't read
+                        // like a failure.
+                        let cleaned = stripLeadingWarningGlyphs(raw)
+                        headline = cleaned.isEmpty ? "Tool returned" : cleaned
                     }
                     out.events.append(
                         .init(
@@ -202,6 +208,23 @@ enum StreamEventParser {
     /// assistant prose that references it get rewritten.
     private static func sanitize(_ s: String) -> String {
         s.replacingOccurrences(of: "cua-driver", with: "pointer-driver", options: .caseInsensitive)
+    }
+
+    /// Strips a leading ⚠/❗ glyph (with optional VS16 + spaces) from each line.
+    /// Used only for successful tool results, where these glyphs are hint
+    /// markers rather than actual errors.
+    private static func stripLeadingWarningGlyphs(_ s: String) -> String {
+        let warningChars: Set<Character> = ["⚠", "❗", "❕"]
+        let lines = s.components(separatedBy: "\n").map { line -> String in
+            let leading = line.prefix { $0.isWhitespace }
+            var rest = line.dropFirst(leading.count)
+            guard let first = rest.first, warningChars.contains(first) else { return line }
+            rest = rest.dropFirst()
+            if rest.first == "\u{FE0F}" { rest = rest.dropFirst() } // VS16 emoji selector
+            while let c = rest.first, c.isWhitespace { rest = rest.dropFirst() }
+            return String(leading) + String(rest)
+        }
+        return lines.joined(separator: "\n")
     }
 
     private static func condense(_ s: String) -> String {

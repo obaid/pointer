@@ -1,32 +1,63 @@
 import SwiftUI
 
-/// The orb — Pointer's primary "is the agent doing something?" surface.
-/// Two states: collapsed (a small pill) and expanded (a full activity panel with cancel).
-///
-/// State note: expansion lives on AgentStore.orbExpanded so AppDelegate can observe and
-/// resize the host NSPanel. We never rebuild the hosted view — only its content reacts.
+/// The orb stack — Pointer's primary "what are my agents up to?" surface.
+/// Each running task gets its own OrbCard, stacked top-down with most recent
+/// on top. At most one card is expanded at a time; the rest stay visible as
+/// collapsed pills so the user always knows what's running.
 struct OrbView: View {
     @ObservedObject var store: AgentStore
-    let onClose: () -> Void
+    let onDismiss: (UUID) -> Void
 
     var body: some View {
-        Group {
-            if store.orbExpanded {
-                ExpandedPanel(store: store, onClose: onClose)
-            } else {
-                CollapsedPill(store: store)
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 8) {
+                ForEach(store.tasks) { task in
+                    OrbCard(store: store, task: task, onDismiss: { onDismiss(task.id) })
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .top).combined(with: .opacity),
+                            removal: .scale(scale: 0.9).combined(with: .opacity)
+                        ))
+                }
             }
+            .padding(.vertical, 0)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .scrollContentBackground(.hidden)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .animation(.spring(response: 0.32, dampingFraction: 0.85), value: store.tasks.map(\.id))
+        .animation(.spring(response: 0.36, dampingFraction: 0.86), value: store.expandedTaskId)
     }
 }
 
-// MARK: - Collapsed pill
-
-private struct CollapsedPill: View {
+/// One task in the stack. Switches between collapsed pill and expanded panel
+/// based on `store.expandedTaskId`. Single-expand semantics — clicking a
+/// collapsed card sets the expanded id, which collapses any other.
+private struct OrbCard: View {
     @ObservedObject var store: AgentStore
+    let task: ActiveTask
+    let onDismiss: () -> Void
+
+    var isExpanded: Bool { store.expandedTaskId == task.id }
+
+    var body: some View {
+        Group {
+            if isExpanded {
+                ExpandedCard(store: store, task: task, onDismiss: onDismiss)
+            } else {
+                CollapsedCard(store: store, task: task, onDismiss: onDismiss)
+            }
+        }
+    }
+}
+
+// MARK: - Collapsed card
+
+private struct CollapsedCard: View {
+    @ObservedObject var store: AgentStore
+    let task: ActiveTask
+    let onDismiss: () -> Void
 
     @State private var pulse = false
+    @State private var hovering = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -42,22 +73,44 @@ private struct CollapsedPill: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
-            Image(systemName: "chevron.down")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.tertiary)
+            trailing
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .frame(width: 280, height: 56)
+        .frame(width: 360, height: 56)
         .background(orbBackground)
         .contentShape(Rectangle())
-        .onTapGesture { store.orbExpanded = true }
+        .onTapGesture { store.expandedTaskId = task.id }
+        .onHover { hovering = $0 }
         .onAppear { pulse = shouldPulse }
         .onChange(of: shouldPulse) { _, p in pulse = p }
     }
 
+    /// Hover-only X overlays the chevron — quick dismiss without expanding.
+    private var trailing: some View {
+        ZStack {
+            Image(systemName: "chevron.down")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.tertiary)
+                .opacity(hovering ? 0 : 1)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .padding(5)
+                    .background(Circle().fill(.quaternary))
+            }
+            .buttonStyle(.plain)
+            .opacity(hovering ? 1 : 0)
+            .help(task.isTerminal ? "Dismiss" : "Cancel & dismiss")
+        }
+        .frame(width: 22, height: 22)
+        .animation(.easeInOut(duration: 0.15), value: hovering)
+    }
+
     private var shouldPulse: Bool {
-        store.isRunning || (store.task?.awaitingReply ?? false)
+        if case .running = task.state { return true }
+        return task.awaitingReply
     }
 
     private var statusDot: some View {
@@ -75,9 +128,6 @@ private struct CollapsedPill: View {
     }
 
     private var dotColor: Color {
-        guard let task = store.task else { return .secondary }
-        // Awaiting a reply outranks the green "done" — same .done state, but
-        // the agent's still effectively waiting on the user.
         if task.awaitingReply { return .yellow }
         switch task.state {
         case .running: return .blue
@@ -87,14 +137,9 @@ private struct CollapsedPill: View {
         }
     }
 
-    private var headline: String {
-        guard let task = store.task else { return "Pointer" }
-        // Always keep the user's prompt visible — status is conveyed by the dot color.
-        return task.prompt
-    }
+    private var headline: String { task.prompt }
 
     private var subline: String {
-        guard let task = store.task else { return "Idle" }
         switch task.state {
         case .running:
             return task.latestActivity?.text ?? "Thinking..."
@@ -113,19 +158,24 @@ private struct CollapsedPill: View {
     }
 }
 
-// MARK: - Expanded panel
+// MARK: - Expanded card
 
-private struct ExpandedPanel: View {
+private struct ExpandedCard: View {
     @ObservedObject var store: AgentStore
-    let onClose: () -> Void
+    let task: ActiveTask
+    let onDismiss: () -> Void
 
     @State private var replyText: String = ""
     @FocusState private var replyFocused: Bool
 
     private var canReply: Bool {
-        guard let task = store.task else { return false }
         if case .done = task.state { return task.canFollowUp }
         if case .failed = task.state { return task.canFollowUp }
+        return false
+    }
+
+    private var isRunning: Bool {
+        if case .running = task.state { return true }
         return false
     }
 
@@ -136,30 +186,30 @@ private struct ExpandedPanel: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
-                        if let task = store.task, task.activity.isEmpty {
+                        if task.activity.isEmpty {
                             Text("Working...")
                                 .font(.system(size: 11))
                                 .foregroundStyle(.tertiary)
                                 .padding(.top, 12)
-                        } else if let task = store.task {
+                        } else {
                             ForEach(task.activity) { event in
                                 ActivityRow(event: event).id(event.id)
                             }
                         }
-                        if let task = store.task, case .done(let summary) = task.state {
-                            ResultBlock(summary: summary).id("__result__")
+                        if case .done(let summary) = task.state {
+                            ResultBlock(summary: summary).id("__result_\(task.id)")
                         }
                     }
                     .padding(14)
                 }
-                .onChange(of: store.task?.activity.count ?? 0) { _, _ in
-                    if let last = store.task?.activity.last {
+                .onChange(of: task.activity.count) { _, _ in
+                    if let last = task.activity.last {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 }
-                .onChange(of: store.task?.state) { _, state in
+                .onChange(of: task.state) { _, state in
                     if case .done = state {
-                        withAnimation { proxy.scrollTo("__result__", anchor: .bottom) }
+                        withAnimation { proxy.scrollTo("__result_\(task.id)", anchor: .bottom) }
                     }
                 }
             }
@@ -179,11 +229,11 @@ private struct ExpandedPanel: View {
             Circle()
                 .fill(headerDotColor)
                 .frame(width: 8, height: 8)
-            Text(headerText)
+            Text(task.prompt)
                 .font(.system(size: 12, weight: .semibold))
                 .lineLimit(1)
             Spacer()
-            Button(action: { store.orbExpanded = false }) {
+            Button(action: { store.expandedTaskId = nil }) {
                 Image(systemName: "chevron.up")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
@@ -192,7 +242,7 @@ private struct ExpandedPanel: View {
             }
             .buttonStyle(.plain)
             .help("Collapse")
-            Button(action: onClose) {
+            Button(action: onDismiss) {
                 Image(systemName: "xmark")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.secondary)
@@ -200,14 +250,13 @@ private struct ExpandedPanel: View {
                     .background(Circle().fill(.quaternary))
             }
             .buttonStyle(.plain)
-            .help("Close")
+            .help(isRunning ? "Cancel & dismiss" : "Dismiss")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
     }
 
     private var headerDotColor: Color {
-        guard let task = store.task else { return .secondary }
         if task.awaitingReply { return .yellow }
         switch task.state {
         case .running: return .blue
@@ -217,15 +266,11 @@ private struct ExpandedPanel: View {
         }
     }
 
-    private var headerText: String {
-        store.task?.prompt ?? "Pointer"
-    }
-
     private var footer: some View {
         HStack {
-            if store.isRunning {
+            if isRunning {
                 Button(role: .destructive) {
-                    store.cancel()
+                    store.cancel(taskId: task.id)
                 } label: {
                     Label("Cancel", systemImage: "stop.circle")
                         .font(.system(size: 12, weight: .medium))
@@ -238,21 +283,13 @@ private struct ExpandedPanel: View {
                     .foregroundStyle(.tertiary)
             }
             Spacer()
-            if !store.isRunning {
-                Button("Dismiss") {
-                    store.dismiss()
-                    onClose()
-                }
-                .controlSize(.small)
-            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
     }
 
     private var durationLabel: String {
-        guard let task = store.task else { return "" }
-        let secs = Int(Date().timeIntervalSince(task.startedAt))
+        let secs = Int((task.endedAt ?? Date()).timeIntervalSince(task.startedAt))
         return "Took \(secs)s"
     }
 
@@ -284,10 +321,12 @@ private struct ExpandedPanel: View {
     private func sendReply() {
         let trimmed = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        store.followUp(reply: trimmed)
+        store.followUp(taskId: task.id, reply: trimmed)
         replyText = ""
     }
 }
+
+// MARK: - Activity row + Result block (shared with HistoryView)
 
 struct ActivityRow: View {
     let event: ActivityEvent
