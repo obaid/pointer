@@ -40,6 +40,8 @@ That's it. The first launch:
 - **Mic button** — click to dictate. Words stream into the field as you speak. Click again (or Esc) to stop.
 - **Orb** — appears top-right while a task is running. Click to expand and see the activity feed. Cancel from the expanded panel.
 - **Follow-ups** — once a task completes, the expanded orb shows a reply field that resumes the same Claude session (`claude -r <session_id>`).
+- **Awaiting reply signal** — when the agent finishes a turn with a question, the orb's status dot turns **amber** (instead of green), the menu bar icon shimmers in amber, and the orb auto-expands once so you don't miss it.
+- **History** — menu bar → **History...** opens a separate window listing every task you've run, with the full activity feed and final result. Stays browsable while a new task runs through the orb. Persisted at `~/Library/Application Support/Pointer/history.jsonl`.
 
 ## Architecture
 
@@ -50,6 +52,8 @@ Sources/Pointer/
 ├── CommandBarView.swift      # Spotlight-style input
 ├── OrbView.swift             # Top-right floating activity panel
 ├── OnboardingView.swift      # First-run setup
+├── HistoryStore.swift        # Persistent task log (JSONL)
+├── HistoryView.swift         # "History" window (master-detail browser)
 ├── Prereqs.swift             # Detects + installs prerequisites at first run
 ├── ClaudeBinary.swift        # Locates the `claude` CLI on $PATH
 ├── StubRunner.swift          # Spawns claude -p, streams NDJSON

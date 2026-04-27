@@ -19,13 +19,17 @@ struct PointerApp: App {
     }
 }
 
-/// MenuBarExtra label with a `.variableColor` shimmer while a task is running.
+/// MenuBarExtra label. Variable-color shimmer while a task is running OR
+/// the agent is awaiting a reply, with an amber tint in the awaiting case so
+/// the user notices even with the orb offscreen.
 struct MenuBarLabel: View {
     @ObservedObject var store: AgentStore
 
     var body: some View {
+        let awaiting = store.task?.awaitingReply ?? false
         Image(systemName: "cursorarrow.rays")
-            .symbolEffect(.variableColor.iterative.reversing, isActive: store.isRunning)
+            .symbolEffect(.variableColor.iterative.reversing, isActive: store.isRunning || awaiting)
+            .foregroundStyle(awaiting ? AnyShapeStyle(Color.yellow) : AnyShapeStyle(.primary))
     }
 }
 
@@ -41,6 +45,8 @@ struct MenuBarMenu: View {
                 .keyboardShortcut(".", modifiers: .command)
         }
         Divider()
+        Button("History...") { AppDelegate.shared?.showHistory() }
+            .keyboardShortcut("h")
         Button("Re-run setup...") { AppDelegate.shared?.showOnboarding() }
         Button("Quit Pointer") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
@@ -54,6 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var commandWindow: KeyableWindow?
     private var orbWindow: KeyableOrbPanel?
     private var onboardingWindow: NSWindow?
+    private var historyWindow: NSWindow?
 
     private let prereqs = PrereqsChecker()
     private let hotkeys = HotkeyMonitor()
@@ -241,6 +248,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             y: f.maxY - size.height - topInset
         )
         panel.setFrame(NSRect(origin: origin, size: size), display: true, animate: false)
+    }
+
+    // MARK: - History
+
+    func showHistory() {
+        NSLog("📚 showHistory invoked, existing window=\(historyWindow != nil), entries=\(HistoryStore.shared.entries.count)")
+        if let w = historyWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            w.makeKeyAndOrderFront(nil)
+            return
+        }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 820, height: 540),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Pointer History"
+        window.isMovableByWindowBackground = true
+        window.minSize = NSSize(width: 760, height: 480)
+        window.animationBehavior = .none
+        window.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: HistoryView(store: HistoryStore.shared))
+        host.frame = NSRect(x: 0, y: 0, width: 820, height: 540)
+        window.contentView = host
+        window.center()
+        historyWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        NSLog("📚 historyWindow ordered front, isVisible=\(window.isVisible) frame=\(window.frame)")
     }
 
     // MARK: - Onboarding

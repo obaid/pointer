@@ -52,8 +52,12 @@ private struct CollapsedPill: View {
         .background(orbBackground)
         .contentShape(Rectangle())
         .onTapGesture { store.orbExpanded = true }
-        .onAppear { pulse = store.isRunning }
-        .onChange(of: store.isRunning) { _, running in pulse = running }
+        .onAppear { pulse = shouldPulse }
+        .onChange(of: shouldPulse) { _, p in pulse = p }
+    }
+
+    private var shouldPulse: Bool {
+        store.isRunning || (store.task?.awaitingReply ?? false)
     }
 
     private var statusDot: some View {
@@ -62,7 +66,7 @@ private struct CollapsedPill: View {
                 .fill(dotColor.opacity(0.25))
                 .frame(width: 22, height: 22)
                 .scaleEffect(pulse ? 1.15 : 1.0)
-                .animation(store.isRunning ? .easeInOut(duration: 1.1).repeatForever(autoreverses: true) : .default, value: pulse)
+                .animation(shouldPulse ? .easeInOut(duration: 1.1).repeatForever(autoreverses: true) : .default, value: pulse)
             Circle()
                 .fill(dotColor)
                 .frame(width: 9, height: 9)
@@ -72,6 +76,9 @@ private struct CollapsedPill: View {
 
     private var dotColor: Color {
         guard let task = store.task else { return .secondary }
+        // Awaiting a reply outranks the green "done" — same .done state, but
+        // the agent's still effectively waiting on the user.
+        if task.awaitingReply { return .yellow }
         switch task.state {
         case .running: return .blue
         case .done: return .green
@@ -201,6 +208,7 @@ private struct ExpandedPanel: View {
 
     private var headerDotColor: Color {
         guard let task = store.task else { return .secondary }
+        if task.awaitingReply { return .yellow }
         switch task.state {
         case .running: return .blue
         case .done: return .green
@@ -281,7 +289,7 @@ private struct ExpandedPanel: View {
     }
 }
 
-private struct ActivityRow: View {
+struct ActivityRow: View {
     let event: ActivityEvent
 
     var body: some View {
@@ -332,7 +340,7 @@ private struct ActivityRow: View {
     }
 }
 
-private struct ResultBlock: View {
+struct ResultBlock: View {
     let summary: String
 
     var body: some View {
@@ -359,7 +367,7 @@ private struct ResultBlock: View {
 
 // MARK: - Shared chrome
 
-private var orbBackground: some View {
+var orbBackground: some View {
     ZStack {
         RoundedRectangle(cornerRadius: 14, style: .continuous)
             .fill(.regularMaterial)

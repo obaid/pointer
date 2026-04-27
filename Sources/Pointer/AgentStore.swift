@@ -2,14 +2,22 @@ import SwiftUI
 import Combine
 
 /// A single human-readable line in the activity feed.
-struct ActivityEvent: Identifiable, Equatable {
-    let id = UUID()
-    let timestamp = Date()
+struct ActivityEvent: Identifiable, Equatable, Codable {
+    let id: UUID
+    let timestamp: Date
     let kind: Kind
     let text: String
     let detail: String?
 
-    enum Kind: Equatable {
+    init(id: UUID = UUID(), timestamp: Date = Date(), kind: Kind, text: String, detail: String?) {
+        self.id = id
+        self.timestamp = timestamp
+        self.kind = kind
+        self.text = text
+        self.detail = detail
+    }
+
+    enum Kind: String, Equatable, Codable {
         case info        // setup / boilerplate
         case message     // assistant prose
         case toolCall    // a tool invocation
@@ -30,25 +38,98 @@ struct ActivityEvent: Identifiable, Equatable {
     }
 }
 
-enum TaskState: Equatable {
+enum TaskState: Equatable, Codable {
     case running
     case done(summary: String)
     case cancelled
     case failed(message: String)
+
+    private enum CodingKeys: String, CodingKey { case kind, value }
+    private enum Kind: String, Codable { case running, done, cancelled, failed }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .running:
+            try c.encode(Kind.running, forKey: .kind)
+        case .done(let s):
+            try c.encode(Kind.done, forKey: .kind)
+            try c.encode(s, forKey: .value)
+        case .cancelled:
+            try c.encode(Kind.cancelled, forKey: .kind)
+        case .failed(let m):
+            try c.encode(Kind.failed, forKey: .kind)
+            try c.encode(m, forKey: .value)
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        switch try c.decode(Kind.self, forKey: .kind) {
+        case .running: self = .running
+        case .done: self = .done(summary: try c.decode(String.self, forKey: .value))
+        case .cancelled: self = .cancelled
+        case .failed: self = .failed(message: try c.decode(String.self, forKey: .value))
+        }
+    }
 }
 
-struct ActiveTask: Identifiable {
-    let id = UUID()
+struct ActiveTask: Identifiable, Codable {
+    let id: UUID
     let prompt: String
     let startedAt: Date
-    var state: TaskState = .running
-    var activity: [ActivityEvent] = []
+    var state: TaskState
+    var activity: [ActivityEvent]
     /// Claude session ID, captured from the first stream event. Used to resume the
     /// conversation when the user sends a follow-up reply.
-    var sessionId: String? = nil
+    var sessionId: String?
+    /// Last time the task transitioned to a terminal state. Used for the
+    /// duration column in History; nil while still running.
+    var endedAt: Date?
+
+    init(
+        id: UUID = UUID(),
+        prompt: String,
+        startedAt: Date,
+        state: TaskState = .running,
+        activity: [ActivityEvent] = [],
+        sessionId: String? = nil,
+        endedAt: Date? = nil
+    ) {
+        self.id = id
+        self.prompt = prompt
+        self.startedAt = startedAt
+        self.state = state
+        self.activity = activity
+        self.sessionId = sessionId
+        self.endedAt = endedAt
+    }
 
     var latestActivity: ActivityEvent? { activity.last }
     var canFollowUp: Bool { sessionId != nil }
+    var isTerminal: Bool {
+        if case .running = state { return false }
+        return true
+    }
+
+    /// Best-effort detection that the agent finished a turn but is asking
+    /// the user a question rather than reporting a complete result. Used to
+    /// switch the orb's status dot to amber + auto-expand the panel.
+    /// Heuristic — false negatives are safe; we'd rather miss a prompt than
+    /// nag the user when the agent actually finished.
+    var awaitingReply: Bool {
+        guard canFollowUp else { return false }
+        guard case .done(let summary) = state else { return false }
+        let trimmed = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasSuffix("?") { return true }
+        let lower = trimmed.lowercased()
+        let cues = [
+            "should i ", "would you like", "do you want", "want me to",
+            "shall i ", "let me know", "please confirm", "please clarify",
+            "could you confirm", "could you clarify", "which would you",
+        ]
+        return cues.contains { lower.contains($0) }
+    }
 }
 
 @MainActor
@@ -106,6 +187,7 @@ final class AgentStore: ObservableObject {
 
         // Mark as running again; keep the activity log so the user sees the full thread.
         current.state = .running
+        current.endedAt = nil
         task = current
 
         appendActivity(.init(kind: .info, text: "→ \(trimmed)", detail: nil))
@@ -125,13 +207,13 @@ final class AgentStore: ObservableObject {
     func cancel() {
         activeProcess?.terminate()
         runHandle?.cancel()
-        if var t = task {
-            if case .running = t.state {
-                t.state = .cancelled
-                task = t
-            }
+        if var t = task, case .running = t.state {
+            t.state = .cancelled
+            t.endedAt = Date()
+            task = t
         }
         appendActivity(.init(kind: .warning, text: "Cancelled", detail: nil))
+        if let t = task { HistoryStore.shared.record(t) }
     }
 
     func dismiss() {
@@ -156,7 +238,15 @@ final class AgentStore: ObservableObject {
     func finish(taskId: UUID, state: TaskState) {
         guard var t = task, t.id == taskId else { return }
         t.state = state
+        t.endedAt = Date()
         task = t
         activeProcess = nil
+        HistoryStore.shared.record(t)
+        // If the agent is asking the user something and the orb is collapsed,
+        // pop it open so the question is visible. Doesn't fire if the user
+        // already has the panel expanded.
+        if t.awaitingReply, !orbExpanded {
+            orbExpanded = true
+        }
     }
 }
