@@ -2,12 +2,7 @@
 
 A native macOS menu-bar agent. You give it a task in plain English (typed or dictated), it drives your Mac to get it done — clicking, typing, reading the screen — and streams what it's doing into a small floating "orb" in the top-right corner.
 
-Pointer is a thin SwiftUI front-end on top of two pieces of infrastructure:
-
-- **Claude Code** — the LLM agent that reasons about the task and decides what to do next.
-- **`cua-driver`** ([trycua/cua](https://github.com/trycua/cua)) — an MCP server that exposes mac automation primitives (screenshot, AX-tree, click, type, hotkey, launch app, …) to the model.
-
-The app shells out to `claude -p --output-format stream-json` and parses the NDJSON event stream into the activity feed.
+Pointer is a thin SwiftUI front-end on top of **Claude Code** — the LLM agent does the reasoning, and Pointer wires it up to the Mac (screenshot, accessibility tree, click, type, hotkey, launch app, …) so it can actually take action. The app shells out to `claude -p --output-format stream-json` and parses the NDJSON event stream into the activity feed.
 
 ## Requirements
 
@@ -16,7 +11,7 @@ The app shells out to `claude -p --output-format stream-json` and parses the NDJ
 - **Claude Code CLI** installed and authenticated — install instructions: <https://docs.claude.com/en/docs/claude-code>
 - A microphone (optional — only if you want voice input)
 
-The app auto-installs `cua-driver` and registers it as an MCP plugin during onboarding.
+Pointer auto-installs its computer-access helper during the first-run onboarding flow — no manual setup required.
 
 ## Quick start
 
@@ -31,7 +26,7 @@ That's it. The first launch:
 1. Drops a status-bar icon (no Dock icon — Pointer runs as an "accessory" app).
 2. Walks you through three onboarding steps:
    - **AI engine** — verifies `claude` is installed and runs.
-   - **Computer access** — installs and registers `cua-driver` as an MCP plugin (one click).
+   - **Computer access** — installs the helper that lets Pointer click, type, and read your apps (one click).
    - **Voice input** *(optional)* — requests Microphone + Speech Recognition permission.
 3. Use **New Task...** from the menu, or press ⌘N when the menu is open, to summon the command bar.
 
@@ -51,7 +46,7 @@ Sources/Pointer/
 ├── CommandBarView.swift      # Spotlight-style input
 ├── OrbView.swift             # Top-right floating activity panel
 ├── OnboardingView.swift      # First-run setup
-├── Prereqs.swift             # Detects + installs claude / cua-driver
+├── Prereqs.swift             # Detects + installs prerequisites at first run
 ├── ClaudeBinary.swift        # Locates the `claude` CLI on $PATH
 ├── StubRunner.swift          # Spawns claude -p, streams NDJSON
 ├── StreamEventParser.swift   # NDJSON → ActivityEvent + tool-name humanizer
@@ -84,7 +79,7 @@ Pointer asks for these macOS permissions:
 |---|---|---|
 | Microphone | First mic click or onboarding "Allow" | Capture audio for dictation |
 | Speech Recognition | Same | Run Apple's on-device transcription model |
-| Accessibility (indirect, via `cua-driver`) | When `cua-driver` first runs | Read the AX-tree of other apps and synthesize input events |
+| Accessibility | First time the agent drives another app | Read other apps' UI elements and synthesize click/keystroke events |
 
 The microphone and speech-recognition usage strings are embedded into the binary's `__TEXT,__info_plist` section via a linker flag in `Package.swift`.
 
