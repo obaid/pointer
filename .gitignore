@@ -1,0 +1,21 @@
+# Swift / SPM build outputs
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Logs / scratch
+*.log
+*.tmp
+/tmp/
