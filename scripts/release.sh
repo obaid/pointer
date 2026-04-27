@@ -45,6 +45,7 @@ echo "==> Assembling Pointer.app bundle..."
 mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 cp ".build/release/Pointer" "$APP/Contents/MacOS/Pointer"
+cp "$ROOT/assets/Pointer.icns" "$APP/Contents/Resources/Pointer.icns"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 cat > "$APP/Contents/Info.plist" <<EOF
@@ -59,6 +60,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
     <key>CFBundleExecutable</key>
+    <string>Pointer</string>
+    <key>CFBundleIconFile</key>
     <string>Pointer</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
