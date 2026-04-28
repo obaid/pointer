@@ -11,9 +11,11 @@ struct CommandBarView: View {
     /// Briefly true when the user tries to submit at the concurrency cap.
     /// Drives the "all slots full" inline warning.
     @State private var capacityWarning: Bool = false
-    /// Engine for THIS submission. Defaults to the saved preference and
-    /// writes back on submit so the choice sticks across launches.
+    /// Configuration for THIS submission. All three default to the saved
+    /// preferences and write back on submit so choices stick across launches.
     @State private var engine: RunnerEngine = EnginePreference.current
+    @State private var modelArg: String? = EnginePreference.preferredModel(for: EnginePreference.current)
+    @State private var reasoningEffort: ReasoningEffort? = EnginePreference.preferredReasoningEffort
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -132,39 +134,44 @@ struct CommandBarView: View {
             Task { await dictator.stop() }
         }
         EnginePreference.current = engine
-        store.submit(prompt: prompt, engine: engine)
+        EnginePreference.setPreferredModel(modelArg, for: engine)
+        if engine.supportsReasoningEffort {
+            EnginePreference.preferredReasoningEffort = reasoningEffort
+        }
+        store.submit(prompt: prompt, engine: engine, modelArg: modelArg, reasoningEffort: reasoningEffort)
         text = ""
         onSubmit()
     }
 
-    /// Bottom row: slot indicator on the left, engine picker on the right.
-    /// The row is always present (so the layout doesn't jump when slots
-    /// appear) but hides individual elements when there's nothing to show.
+    /// Bottom row: slot indicator on the left, config chip on the right.
+    /// The row appears whenever there's something useful to show — slots in
+    /// flight, or at least one engine installed (the chip lets the user pick
+    /// model + effort even with a single engine).
     @ViewBuilder
     private var helperRow: some View {
         let showSlots = store.runningCount > 0 || capacityWarning
-        if showSlots || shouldShowEnginePicker {
+        if showSlots || hasInstalledEngine {
             HStack(spacing: 8) {
                 if showSlots {
                     slotIndicator
                 } else {
                     Spacer(minLength: 0)
                 }
-                EnginePicker(selection: $engine)
+                ConfigChip(
+                    engine: $engine,
+                    modelArg: $modelArg,
+                    reasoningEffort: $reasoningEffort
+                )
             }
             .padding(.leading, 30)
             .padding(.top, 2)
         }
     }
 
-    /// Whether the engine picker should appear. Hidden when only one engine
-    /// is installed (no choice to make). Cheap probe — re-evaluated on every
-    /// render so newly-installed engines show up without needing a restart.
-    private var shouldShowEnginePicker: Bool {
-        let installed = RunnerEngine.allCases.filter {
+    private var hasInstalledEngine: Bool {
+        RunnerEngine.allCases.contains {
             FileManager.default.isExecutableFile(atPath: $0.locateBinary())
         }
-        return installed.count > 1
     }
 
     /// Five small pips + an N/5 label. Fills left-to-right with the current

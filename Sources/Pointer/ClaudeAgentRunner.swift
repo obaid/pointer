@@ -4,7 +4,13 @@ import Foundation
 /// streams NDJSON events into the AgentStore as they arrive. Owns the Process
 /// reference so AgentStore.cancel(taskId:) can terminate the run.
 enum ClaudeAgentRunner {
-    static func run(prompt: String, resumeSessionId: String?, taskId: UUID, store: AgentStore?) async {
+    static func run(
+        prompt: String,
+        resumeSessionId: String?,
+        modelArg: String? = nil,
+        taskId: UUID,
+        store: AgentStore?
+    ) async {
         let claudePath = ClaudeBinary.locate()
         guard let store else { return }
 
@@ -22,6 +28,9 @@ enum ClaudeAgentRunner {
             "--include-partial-messages",
             "--verbose",
         ]
+        if let modelArg {
+            args += ["--model", modelArg]
+        }
         if let resumeSessionId {
             args += ["-r", resumeSessionId]
         }

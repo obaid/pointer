@@ -9,11 +9,18 @@ import Foundation
 ///   --skip-git-repo-check                        we run in ~/pointer-workspace
 ///   --dangerously-bypass-approvals-and-sandbox   match Claude's --dangerously-skip-permissions UX
 enum CodexAgentRunner {
-    static func run(prompt: String, resumeSessionId: String?, taskId: UUID, store: AgentStore?) async {
+    static func run(
+        prompt: String,
+        resumeSessionId: String?,
+        modelArg: String? = nil,
+        reasoningEffort: ReasoningEffort? = nil,
+        taskId: UUID,
+        store: AgentStore?
+    ) async {
         guard let store else { return }
         let codexPath = CodexBinary.locate()
         let workspace = AgentWorkspace.ensure()
-        NSLog("🤖 CodexAgentRunner.run prompt=\(prompt.prefix(80)) resume=\(resumeSessionId ?? "<new>")")
+        NSLog("🤖 CodexAgentRunner.run prompt=\(prompt.prefix(80)) resume=\(resumeSessionId ?? "<new>") model=\(modelArg ?? "default") effort=\(reasoningEffort?.rawValue ?? "default")")
 
         let process = Process()
         let stdoutPipe = Pipe()
@@ -29,6 +36,13 @@ enum CodexAgentRunner {
             "--skip-git-repo-check",
             "--dangerously-bypass-approvals-and-sandbox",
         ]
+        if let modelArg {
+            args += ["-m", modelArg]
+        }
+        if let reasoningEffort {
+            // Codex exposes reasoning effort as a config knob, not a flag.
+            args += ["-c", "model_reasoning_effort=\(reasoningEffort.rawValue)"]
+        }
         args.append(prompt)
         process.arguments = args
         process.currentDirectoryURL = workspace
